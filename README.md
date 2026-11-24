@@ -10,6 +10,15 @@
 
 工业模型始终由官方训练程序产出。插槽保持默认内容时，训练结果与官方逐字节相同。系统里不写死任何任务或字段名，数据结构由工具自己发现。
 
+## 演示视频与文档
+
+| 内容 | 链接 |
+|---|---|
+| 5 分钟演示视频（中文字幕已压入画面） | [demo/智训引擎演示.mp4](demo/智训引擎演示.mp4)，字幕文件 [demo/智训引擎演示.srt](demo/智训引擎演示.srt)，分镜 [demo/分镜与字幕.md](demo/分镜与字幕.md) |
+| 项目说明书 | [docs/pdf/项目说明书.pdf](docs/pdf/项目说明书.pdf) |
+| 系统运行说明 | [docs/pdf/系统运行说明.pdf](docs/pdf/系统运行说明.pdf)（源文件 [docs/系统运行说明.md](docs/系统运行说明.md)） |
+| 基础模型使用与实验记录 | [docs/实验记录.md](docs/实验记录.md)，云端记录 [SwanLab](https://swanlab.cn/@SSZXlcy/AgentModel-zhixun-harness) |
+
 ## 环境
 
 官方训练器锁定 NumPy 1.26.4，请使用 `.venv-official`：
