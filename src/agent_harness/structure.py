@@ -101,6 +101,29 @@ def group_shares(table: Table, group_by: list[str], answer_classes: list[str] | 
             "top": [(str(values[i]), int(counts[i])) for i in order[:8]]}
 
 
+SEGMENT_FIELD = "_countdown_run"        # synthetic meta field holding a recovered entity (never a model input)
+
+
+def countdown_runs(y: np.ndarray, min_share: float = 0.9) -> dict | None:
+    """Entities recovered from the order of the answers alone, for rows that carry no `meta`.
+
+    A remaining-life target falls by one constant step from row to row while the same unit is observed
+    (N-1, N-2, ..., 0); where that chain breaks, the next unit starts. Accepted only when the step is
+    positive and holds for at least `min_share` of consecutive pairs; otherwise rows are independent.
+    Returns {"run": run index per row, "step": step, "share": share} or None."""
+    y = np.asarray(y, dtype=float)
+    if len(y) < 3:
+        return None
+    diffs = np.round(y[:-1] - y[1:], 6)
+    values, counts = np.unique(diffs, return_counts=True)
+    step = float(values[np.argmax(counts)])
+    share = float(counts.max() / len(diffs))
+    if step <= 0 or share < min_share:
+        return None
+    run = np.concatenate([[0], np.cumsum(diffs != step)])
+    return {"run": run, "step": step, "share": round(share, 4)}
+
+
 def detect(table: Table, task_type: str) -> dict:
     """Best entity key and order field, or {"entity": None} when rows look independent."""
     orders = order_candidates(table)

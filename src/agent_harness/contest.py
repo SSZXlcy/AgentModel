@@ -38,7 +38,7 @@ from .controller import _cap
 from .data import load_table, write_lines
 from .experiments import FUTILITY_FOLDS, _cut_points, _paired
 from .signature import COVERED_NOVELTY, NOVELTY_QUANTILE, NOVELTY_REFERENCE_ROWS, _nearest
-from .structure import detect
+from .structure import SEGMENT_FIELD, countdown_runs, detect
 
 TASKS = ("classification", "regression")
 PREDICT_ARGV = ["python3", "/app/harness.py", "predict"]
@@ -50,9 +50,11 @@ OPENING_ROWS = 6000
 ROUND_EPOCHS = 5            # epochs of one continuation candidate (the official continuation example)
 CONSERVE_EPOCHS = 2
 SELECTION_Z = 1.0           # a candidate is promoted by the rule when its gain exceeds 1 bootstrap sd
+SAFE_Z = 0.5                # the model may pick a candidate only when its gain exceeds half a bootstrap sd
 BOOTSTRAP_REPS = 200
 CAP_IMBALANCE = 3.0         # E-cap: entity (or class) sizes differ by more than 3x the median
 REPLY_TOKENS = 400
+NASA_TOLERANCE = 0.2        # with NASA in the task contract, a candidate may not worsen it by more than 20%
 # The submitted model identity (written into the image). The platform binds the model of each round
 # (rnd.model_name) and holds the key; this value is only recorded and compared, never sent anywhere.
 MODEL_ID = os.environ.get("AGENT_HARNESS_MODEL", "Qwen/Qwen3.8-27B")
@@ -107,15 +109,33 @@ class Situation:
         self.train = load_table(self.train_path, code, self.profile, [])
         self.validation = load_table(self.validation_path, code, self.profile, [])
         self.train_sha = _sha_file(self.train_path)
+        self.validation_sha = _sha_file(self.validation_path)
         found = detect(self.train, self.task)
         self.entity = found["entity"] or []
         self.countdown = bool(found.get("countdown"))
         self.structure = {k: v for k, v in found.items() if k != "checked"}
+        self.structure["source"] = "meta" if self.entity else None
+        validation_runs = None
+        if not self.entity and self.task == "regression":
+            # The platform projection carries only id, inputs and answer: recover units from the answer order.
+            runs = countdown_runs(self.train.y)
+            if runs is not None:
+                for m, r in zip(self.train.meta, runs["run"]):
+                    m[SEGMENT_FIELD] = f"t{int(r)}"
+                self.entity, self.countdown = [SEGMENT_FIELD], True
+                self.structure.update(entity=self.entity, countdown=True, source="answer_order",
+                                      step=runs["step"], share=runs["share"], groups=int(runs["run"][-1]) + 1)
+                validation_runs = countdown_runs(self.validation.y)
+                if validation_runs is not None:
+                    for m, r in zip(self.validation.meta, validation_runs["run"]):
+                        m[SEGMENT_FIELD] = f"v{int(r)}"
         self.train_groups = self.train.key(self.entity)
         # A validation projection without the entity fields is scored row by row.
         has_entity = bool(self.entity) and all(all(f in m for f in self.entity) for m in self.validation.meta[:50])
         self.val_groups = self.validation.key(self.entity) if has_entity else self.validation.ids
         self.stream_format = self._format(has_entity)
+        if self.structure.get("source") == "answer_order" and validation_runs is None:
+            self.stream_format = "snapshot"     # validation rows do not chain into lives: one row per unit
         self.novelty = self._novelty()
 
     def _format(self, has_entity: bool) -> str:
@@ -146,7 +166,8 @@ class Situation:
         return counts
 
     def signature(self) -> dict:
-        return {"task": self.task, "entity": self.entity, "countdown": self.countdown,
+        return {"task": self.task, "entity": self.entity, "entity_source": self.structure.get("source"),
+                "countdown": self.countdown,
                 "stream_format": self.stream_format, "input_novelty": self.novelty,
                 "inputs_covered": self.novelty <= COVERED_NOVELTY, "train_rows": len(self.train),
                 "validation_rows": len(self.validation), "train_entities": len(set(self.train_groups.tolist()))
@@ -377,11 +398,26 @@ def evaluate(sit: Situation, model_module, candidates: list[Candidate]) -> dict:
     return parent
 
 
-def rule_choice(candidates: list[Candidate], parent_id: str) -> tuple[str, str]:
-    promotable = [c for c in candidates if c.artifact_id and c.diff["gain"] > 0
-                  and c.diff["gain"] > SELECTION_Z * c.diff["sd"]]
+def nasa_guarded(task_contract) -> bool:
+    """The asymmetric remaining-life score counts when the frozen task contract names it."""
+    return "nasa" in json.dumps(task_contract or {}, ensure_ascii=False).lower()
+
+
+def safe(c: Candidate, parent: dict, guard: bool) -> bool:
+    """A candidate may serve only if it is not worse than the parent (and, when NASA counts, does not
+    trade a small RMSE gain for a much larger over-estimation penalty)."""
+    if not c.artifact_id or c.diff["gain"] <= 0 or c.diff["gain"] <= SAFE_Z * c.diff["sd"]:
+        return False
+    if guard and "nasa" in (c.local or {}) and "nasa" in parent:
+        return c.local["nasa"] <= parent["nasa"] * (1 + NASA_TOLERANCE)
+    return True
+
+
+def rule_choice(candidates: list[Candidate], parent_id: str, parent: dict | None = None,
+                guard: bool = False) -> tuple[str, str]:
+    promotable = [c for c in candidates if safe(c, parent or {}, guard) and c.diff["gain"] > SELECTION_Z * c.diff["sd"]]
     if not promotable:
-        return parent_id, "no candidate beats the parent by more than its bootstrap sd on public validation"
+        return parent_id, "no safe candidate beats the parent by more than its bootstrap sd on public validation"
     best = max(promotable, key=lambda c: c.diff["gain"])
     return best.artifact_id, f"{best.key} gains {best.diff['gain']:+.4f} (sd {best.diff['sd']:.4f}) over the parent"
 
@@ -394,18 +430,21 @@ _DECIDER = (
     "只返回 JSON：{\"select\": \"<artifact_id>\", \"reason\": \"一句话理由，不超过60字\"}。")
 
 
-def ask_model(rnd, sit: Situation, rhythm: str, opening: dict | None, parent_metrics: dict,
-              candidates: list[Candidate], rule: tuple[str, str], history: list) -> tuple[str | None, str, str]:
-    choices = [{"artifact_id": rnd.parent.artifact_id, "what": "父模型（不换）", "validation": _brief(parent_metrics)}]
+def ask_model(rnd, signature: dict, rhythm: str, opening: dict | None, parent_brief: dict,
+              candidates: list[Candidate], rule: tuple[str, str], history: list, guard: bool = False,
+              note: str | None = None) -> tuple[str | None, str, str]:
+    choices = [{"artifact_id": rnd.parent.artifact_id, "what": "父模型（不换）", "validation": parent_brief}]
     for c in candidates:
         if c.artifact_id:
-            choices.append({"artifact_id": c.artifact_id, "what": c.change, "validation": _brief(c.local),
+            choices.append({"artifact_id": c.artifact_id, "what": c.change, "validation": _brief(c.local, guard),
                             "gain_vs_parent": round(c.diff["gain"], 5), "sd": round(c.diff["sd"], 5),
                             "row_epochs": c.config["train_rows"] * c.config["epochs"]})
-    payload = {"dataset": rnd.dataset_key, "round": rnd.round_index, "signature": sit.signature(), "rhythm": rhythm,
+    payload = {"dataset": rnd.dataset_key, "round": rnd.round_index, "signature": signature, "rhythm": rhythm,
                "opening": None if not opening else {"chosen": opening["chosen"],
                                                     "trials": [_trial_brief(t) for t in opening["trials"]]},
                "past_rounds": len(history), "choices": choices, "rule_recommendation": rule[0]}
+    if note:
+        payload["note"] = note
     limit = max(1, min(REPLY_TOKENS, int(rnd.max_output_tokens)))
     receipt = rnd.model([{"role": "system", "content": _DECIDER},
                          {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
@@ -417,10 +456,10 @@ def ask_model(rnd, sit: Situation, rhythm: str, opening: dict | None, parent_met
         return None, "reply was not a JSON object", receipt.call_id
 
 
-def _brief(m: dict | None) -> dict:
+def _brief(m: dict | None, nasa: bool = False) -> dict:
     if not m:
         return {}
-    keys = ("macro_f1", "accuracy") if "macro_f1" in m else ("rmse", "mae")
+    keys = ("macro_f1", "accuracy") if "macro_f1" in m else ("rmse", "mae") + (("nasa",) if nasa else ())
     return {k: round(float(m[k]), 4) for k in keys if k in m}
 
 
@@ -484,9 +523,16 @@ def train(rnd) -> None:
     descriptor = rnd.parent.descriptor
     checkpoint_name = descriptor["checkpoint_paths"][0]
     parent_ckpt = rnd.parent.path(checkpoint_name, root=os.environ.get("CONTEST_PREVIOUS"))
+    guard = nasa_guarded(rnd.task)
+    last = (state.get("rounds") or [None])[-1]
+    shas = {"parent_sha": rnd.parent.checkpoint_sha256, "train_sha": _sha_file(Path(rnd.data.train_path)),
+            "validation_sha": _sha_file(Path(rnd.data.validation_path))}
+    if last and not last.get("promoted") and last.get("signature") and all(last.get(k) == v for k, v in shas.items()):
+        return _unchanged_round(rnd, state, last, history, work, started, guard)
     base = codebase.base_version(_vendor(), work / "code")
     model_module = base.modules().model
     sit = Situation(rnd, work, base, parent_ckpt)
+    state["seed"] = int(sit.parent.meta["seed"])
     signature = sit.signature()
     log(f"round {rnd.round_index} dataset {rnd.dataset_key}: {json.dumps(signature, ensure_ascii=False)}")
     if rnd.model_name.split("/")[-1].lower() != MODEL_ID.split("/")[-1].lower():
@@ -543,9 +589,10 @@ def train(rnd) -> None:
         c.summary = reply.get("summary")
         log(f"{c.key}: artifact {c.artifact_id} local {c.config['local_validation']} paired {c.diff}")
 
-    rule = rule_choice(candidates, rnd.parent.artifact_id)
-    picked, why, call_id = ask_model(rnd, sit, rhythm, opening, parent_metrics, candidates, rule, history)
-    allowed = {rnd.parent.artifact_id} | {c.artifact_id for c in candidates if c.artifact_id and c.diff["gain"] > 0}
+    rule = rule_choice(candidates, rnd.parent.artifact_id, parent_metrics, guard)
+    picked, why, call_id = ask_model(rnd, signature, rhythm, opening, _brief(parent_metrics, guard), candidates,
+                                     rule, history, guard)
+    allowed = {rnd.parent.artifact_id} | {c.artifact_id for c in candidates if safe(c, parent_metrics, guard)}
     if picked in allowed:
         selected, reason = picked, f"模型选择：{why}（规则建议 {rule[0]}：{rule[1]}）"
     else:
@@ -555,9 +602,10 @@ def train(rnd) -> None:
 
     _credit(state, [rhythm_experience] + list(strategy.get("experiences") or []),
             max((c.diff["gain"] for c in candidates), default=None))
-    state["rounds"].append({"round": rnd.round_index, "stage": rnd.stage_id, "train_sha": sit.train_sha,
+    state["rounds"].append({"round": rnd.round_index, "stage": rnd.stage_id, **shas,
                             "rhythm": rhythm, "selected": selected, "promoted": chosen is not None,
-                            "gain_vs_parent": round(gain, 6), "novelty": sit.novelty,
+                            "gain_vs_parent": round(gain, 6), "novelty": sit.novelty, "signature": signature,
+                            "parent_validation": _brief(parent_metrics, guard), "trained": True,
                             "seconds": round(time.monotonic() - started, 1)})
     state["rounds"] = state["rounds"][-50:]
     save_state(rnd, state, work)
@@ -571,12 +619,46 @@ def train(rnd) -> None:
         configuration={"rhythm": rhythm, "selected_arm": chosen.key if chosen else "parent",
                        "candidates": {c.key: c.artifact_id for c in candidates},
                        "paired_vs_parent": {c.key: c.config["paired_vs_parent"] for c in candidates},
-                       "rule": rule[0], "model_pick": picked, "signature": signature,
+                       "rule": rule[0], "model_pick": picked, "signature": signature, "nasa_guard": guard,
                        "model": {"submitted": MODEL_ID, "bound": rnd.model_name}},
         seed=int(sit.parent.meta["seed"]),
         history_ids=[item["id"] for item in history],
         model_call_ids=[call_id])
     log(f"round finished in {time.monotonic() - started:.1f}s; selected {selected}")
+
+
+def _unchanged_round(rnd, state: dict, last: dict, history: list, work: Path, started: float, guard: bool) -> None:
+    """Parent, training set and validation set are byte-identical to the last round, which kept its parent:
+    a continuation would reproduce the candidate already rejected (training is deterministic), so nothing is
+    trained. The round still asks the model, which may only keep the parent."""
+    rhythm = "conserve"
+    rule = (rnd.parent.artifact_id, "parent, training and validation data are unchanged since the last round, "
+                                    "which kept its parent; a continuation would repeat the rejected candidate")
+    picked, why, call_id = ask_model(rnd, last["signature"], rhythm, None, last.get("parent_validation") or {}, [],
+                                     rule, history, guard, note="数据与父模型都没有变化，本轮没有训练新候选。")
+    selected = rnd.parent.artifact_id
+    source = "模型" if picked == selected else "规则"
+    reason = f"{source}选择：保留父模型。{rule[1]}（模型回复：{why or '无'}）"
+    state["rounds"].append({**{k: last.get(k) for k in ("parent_sha", "train_sha", "validation_sha", "signature",
+                                                        "parent_validation", "novelty")},
+                            "round": rnd.round_index, "stage": rnd.stage_id, "rhythm": rhythm, "selected": selected,
+                            "promoted": False, "gain_vs_parent": 0.0, "trained": False,
+                            "seconds": round(time.monotonic() - started, 1)})
+    state["rounds"] = state["rounds"][-50:]
+    save_state(rnd, state, work)
+    rnd.finish(
+        selected_artifact_id=selected,
+        hypothesis="父模型、训练集与验证集都与上一轮相同，续训只会复现上一轮已被拒绝的候选。",
+        change_summary="本轮未训练；父检查点保持不变。",
+        reason=reason[:3900],
+        configuration={"rhythm": rhythm, "selected_arm": "parent", "trained": False, "candidates": {},
+                       "paired_vs_parent": {},
+                       "model_pick": picked, "signature": last["signature"], "nasa_guard": guard,
+                       "model": {"submitted": MODEL_ID, "bound": rnd.model_name}},
+        seed=int(state.get("seed", 42)),
+        history_ids=[item["id"] for item in history],
+        model_call_ids=[call_id])
+    log(f"round finished in {time.monotonic() - started:.1f}s without training; kept {selected}")
 
 
 # -------------------------------------------------------------------------------------------- predict

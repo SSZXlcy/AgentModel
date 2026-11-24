@@ -36,6 +36,24 @@ ROOT = Path(__file__).resolve().parents[1]
 PACKAGES = {"A": "cpu-a-guide-20261110-v1", "B": "cpu-b-rul-20261110-v1", "C": "cpu-c-guide-20261110-v1"}
 TASK = {"A": "classification", "B": "regression", "C": "regression"}
 DOCKER: str | None = None
+STAGE_EVERY = 0             # >0: the public projection changes every N rounds, as the platform's stages do
+
+
+def stage_data(key: str, index: int) -> Path:
+    """The `public/` directory a round sees. Stage s keeps the training set and drops the first s tenths of the
+    validation rows (contiguous, so units stay whole apart from the first)."""
+    package = ROOT / PACKAGES[key]
+    stage = (index - 1) // STAGE_EVERY if STAGE_EVERY else 0
+    if stage == 0:
+        return package / "public"
+    target = Path(tempfile.gettempdir()) / "smoke-stages" / f"{Path(PACKAGES[key]).name}-s{stage}" / "public"
+    if not (target / "validation.jsonl").is_file():
+        target.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(package / "public" / "train.jsonl", target / "train.jsonl")
+        lines = [l for l in (package / "public" / "validation.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
+        keep = lines[int(len(lines) * min(stage, 5) / 10):]
+        (target / "validation.jsonl").write_text("\n".join(keep) + "\n", encoding="utf-8")
+    return target
 
 
 def docker(image: str, command: str, mounts: dict[str, Path], env: dict[str, str]) -> list[str]:
@@ -65,14 +83,18 @@ def fake_model(messages: list, options: dict) -> dict:
     payload = json.loads(messages[-1]["content"])
     best = max(payload["choices"], key=lambda c: c.get("gain_vs_parent", 0.0))
     text = json.dumps({"select": best["artifact_id"], "reason": "收益最大（本地替身模型）"}, ensure_ascii=False)
-    fake_model.calls += 1
-    return {"request_id": f"call-{fake_model.calls}", "choices": [{"message": {"role": "assistant", "content": text}}]}
+    with LOCK:
+        fake_model.calls += 1
+        number = fake_model.calls
+    return {"request_id": f"call-{number}", "choices": [{"message": {"role": "assistant", "content": text}}]}
 
 
 fake_model.calls = 0
 
 LIVE: dict | None = None
 CALLS: list[dict] = []
+LOCK = threading.Lock()
+PROMPT = "官方固定任务提示（本地替身）"
 
 
 def bind_task_prompt(messages: list, prompt: str) -> list:
@@ -82,7 +104,7 @@ def bind_task_prompt(messages: list, prompt: str) -> list:
     return [{"role": "system", "content": prompt}, *messages]
 
 
-def live_model(messages: list, options: dict) -> dict:
+def live_model(messages: list, options: dict, tag: str = "") -> dict:
     import urllib.error
     import urllib.request
     body = {"model": LIVE["model"], "messages": messages, "stream": False,
@@ -94,14 +116,19 @@ def live_model(messages: list, options: dict) -> dict:
     try:
         with urllib.request.urlopen(request, timeout=180) as response:
             payload = json.load(response)
-    except urllib.error.HTTPError as error:
-        raise RuntimeError(f"endpoint answered HTTP {error.code}: {error.read()[:300]!r}") from None
+    except (urllib.error.URLError, TimeoutError, OSError) as error:
+        code = getattr(error, "code", None)
+        with LOCK:
+            CALLS.append({"tag": tag, "seconds": round(time.monotonic() - started, 1), "failed": f"HTTP {code}" if code else type(error).__name__,
+                          "prompt_chars": sum(len(m.get("content") or "") for m in messages)})
+        raise RuntimeError(f"endpoint failed: {code or type(error).__name__}") from None
     content = (payload.get("choices") or [{}])[0].get("message", {}).get("content") or ""
-    CALLS.append({"seconds": round(time.monotonic() - started, 1), "usage": payload.get("usage"),
+    with LOCK:
+        CALLS.append({"tag": tag, "seconds": round(time.monotonic() - started, 1), "usage": payload.get("usage"),
                   "finish_reason": (payload.get("choices") or [{}])[0].get("finish_reason"),
                   "request_options": {k: v for k, v in body.items() if k not in ("messages", "model")},
                   "prompt_chars": sum(len(m.get("content") or "") for m in messages), "reply": content})
-    payload["request_id"] = "live-" + str(payload.get("id") or len(CALLS))
+        payload["request_id"] = "live-" + str(payload.get("id") or len(CALLS))
     return payload
 
 
@@ -144,7 +171,8 @@ class Host:
                     raise RuntimeError("max_tokens above limit")
                 options = {k: v for k, v in frame.items() if k not in ("type", "id", "messages")}
                 if LIVE:
-                    response = live_model(bind_task_prompt(frame["messages"], self.start["prompt"]), options)
+                    response = live_model(bind_task_prompt(frame["messages"], self.start["prompt"]), options,
+                                          f"{self.start['dataset_key']}-r{self.start['round_index']}")
                 else:
                     response = fake_model(frame["messages"], options)
                 reply = {"type": "model_response", "id": frame["id"], "call_id": response.pop("request_id"),
@@ -203,15 +231,16 @@ def environment(sdk: Path, work: Path, previous: Path) -> dict:
 
 def run_round(sdk: Path, key: str, index: int, parent_id: str, parent_root: Path, state_dir: Path | None,
               store: Path, history: list) -> Host:
-    package = ROOT / PACKAGES[key]
+    package = ROOT / PACKAGES[key]          # an absolute override (--strip-meta) replaces ROOT
+    public = stage_data(key, index)
     parent = receipt(parent_id, parent_root, ["checkpoint.npz"],
                      ["baselines/model.py"] if (parent_root / "baselines" / "model.py").is_file() else [])
-    train_path, validation_path = package / "public" / "train.jsonl", package / "public" / "validation.jsonl"
+    train_path, validation_path = public / "train.jsonl", public / "validation.jsonl"
     if DOCKER:
         train_path, validation_path = "/data/train.jsonl", "/data/validation.jsonl"
-    start = {"type": "start", "protocol": "contest.harness.workspace.v2", "prompt": "官方固定任务提示（本地替身）",
+    start = {"type": "start", "protocol": "contest.harness.workspace.v2", "prompt": PROMPT,
              "prompt_version": "industrial-workspace-flexible-v3", "dataset_key": key, "round_index": index,
-             "stage_id": f"stage-{index}", "run_id": "local-smoke", "model_name": "Qwen3.8-27B",
+             "stage_id": f"stage-{(index - 1) // STAGE_EVERY if STAGE_EVERY else 0}", "run_id": "local-smoke", "model_name": "Qwen3.8-27B",
              "max_output_tokens": 2048, "wall_seconds": 900,
              "task_contract": {"task_type": TASK[key], "public_projection": {
                  "train_path": str(train_path), "validation_path": str(validation_path)}},
@@ -222,7 +251,7 @@ def run_round(sdk: Path, key: str, index: int, parent_id: str, parent_root: Path
     work.mkdir(parents=True)
     host = Host(start, store)
     if DOCKER:
-        mounts = {"/data": package / "public", "/previous": parent_root, "/workspace": work}
+        mounts = {"/data": public, "/previous": parent_root, "/workspace": work}
         if state_dir:
             mounts["/state"] = state_dir
         argv, env = docker(DOCKER, "train", mounts, {}), None
@@ -235,6 +264,9 @@ def run_round(sdk: Path, key: str, index: int, parent_id: str, parent_root: Path
     reader.start()
     try:
         host.serve(process)
+    except BaseException:
+        process.kill()          # the platform ends a round whose RPC failed; do not leave it waiting
+        raise
     finally:
         process.wait(timeout=1200)
         reader.join()
@@ -277,9 +309,38 @@ def main() -> None:
     parser.add_argument("--live", action="store_true", help="forward model requests to a real endpoint")
     parser.add_argument("--live-base-url", help="OpenAI-compatible base URL (…/v1); default LLM_BASE_URL")
     parser.add_argument("--live-model", help="model id at that endpoint; default LLM_MODEL_ID")
+    parser.add_argument("--strip-meta", action="store_true",
+                        help="serve rows as the platform does: only id, inputs and answer (no meta)")
+    parser.add_argument("--stage-every", type=int, default=0,
+                        help="change the validation projection every N rounds (simulated platform stages)")
+    parser.add_argument("--rounds", type=int, default=2, help="checkpoint rounds per dataset (the platform runs 10)")
+    parser.add_argument("--parallel", action="store_true", help="run the datasets at the same time, as the platform does")
+    parser.add_argument("--prompt-bytes", type=int, default=0,
+                        help="pad the stand-in official prompt to about this many UTF-8 bytes (the platform's is up to 8000)")
     args = parser.parse_args()
-    global DOCKER, LIVE
+    global DOCKER, LIVE, PROMPT, STAGE_EVERY
     DOCKER = args.docker
+    STAGE_EVERY = args.stage_every
+    if args.strip_meta:
+        stripped = Path(tempfile.mkdtemp(prefix="stripped-"))
+        for key in args.datasets:
+            source = ROOT / PACKAGES[key]
+            target = stripped / PACKAGES[key]
+            (target / "public").mkdir(parents=True)
+            shutil.copyfile(source / "checkpoint.npz", target / "checkpoint.npz")
+            for name in ("train.jsonl", "validation.jsonl"):
+                with (source / "public" / name).open(encoding="utf-8") as src, (target / "public" / name).open("w", encoding="utf-8") as dst:
+                    for line in src:
+                        if line.strip():
+                            row = json.loads(line)
+                            dst.write(json.dumps({k: row[k] for k in ("id", "inputs", "answer")}, ensure_ascii=False) + "\n")
+            PACKAGES[key] = str(target)
+    if args.prompt_bytes:
+        filler = "本轮为检查点续训轮次，请依据任务合同、数据集说明与检查点信息作出选择。"
+        text = PROMPT
+        while len((text + filler).encode("utf-8")) <= min(args.prompt_bytes, 7900):
+            text += filler
+        PROMPT = text
     if args.live:
         sys.path.insert(0, str(ROOT / "src"))
         from agent_harness.agent import OpenAICompatibleProvider, _read_key
@@ -289,26 +350,45 @@ def main() -> None:
             raise SystemExit("no key: set PYTRIO_API_KEY / LLM_API_KEY or create ~/.agent_harness/llm_key")
         LIVE = {"base_url": args.live_base_url or default.base_url, "model": args.live_model or default.model, "key": key}
         print(json.dumps({"live_endpoint": LIVE["base_url"], "model": LIVE["model"]}), file=sys.stderr)
-    for key in args.datasets:
+    def run_dataset(key: str) -> None:
         store = Path(tempfile.mkdtemp(prefix=f"smoke-{key}-")) if not args.keep else args.keep / key
         store.mkdir(parents=True, exist_ok=True)
         started = time.monotonic()
         parent_id, parent_root, state, history = "official-baseline", ROOT / PACKAGES[key], None, []
-        for index in (1, 2):
-            host = run_round(args.sdk, key, index, parent_id, parent_root, state, store, history)
-            record = host.record
-            print(json.dumps({"dataset": key, "round": index, "selected": record["selected_artifact_id"],
-                              "reason": record["reason"], "calls": record["model_call_ids"],
-                              "config": {k: record["configuration"][k] for k in ("rhythm", "selected_arm", "paired_vs_parent")}},
-                             ensure_ascii=False))
-            history.append({"id": f"rec-{index}", "selected_artifact_id": record["selected_artifact_id"]})
-            if record["selected_artifact_id"] in host.artifacts:
-                parent_id, parent_root = record["selected_artifact_id"], host.artifacts[record["selected_artifact_id"]]
-            state = host.state_dir
-        print(json.dumps({"dataset": key, "served": parent_id, "prediction_check": serve_predictions(args.sdk, key, parent_root),
-                          "seconds": round(time.monotonic() - started, 1)}, ensure_ascii=False))
-        if not args.keep:
-            shutil.rmtree(store, ignore_errors=True)
+        try:
+            for index in range(1, args.rounds + 1):
+                round_started = time.monotonic()
+                try:
+                    host = run_round(args.sdk, key, index, parent_id, parent_root, state, store, history)
+                except Exception as error:
+                    print(json.dumps({"dataset": key, "round": index, "failed": str(error)[:300],
+                                      "seconds": round(time.monotonic() - round_started, 1)}, ensure_ascii=False), flush=True)
+                    return
+                record = host.record
+                print(json.dumps({"dataset": key, "round": index, "seconds": round(time.monotonic() - round_started, 1),
+                                  "selected": record["selected_artifact_id"], "reason": record["reason"][:160],
+                                  "calls": record["model_call_ids"],
+                                  "config": {k: record["configuration"].get(k) for k in ("rhythm", "selected_arm", "paired_vs_parent", "trained")}},
+                                 ensure_ascii=False), flush=True)
+                history.append({"id": f"rec-{index}", "selected_artifact_id": record["selected_artifact_id"]})
+                if record["selected_artifact_id"] in host.artifacts:
+                    parent_id, parent_root = record["selected_artifact_id"], host.artifacts[record["selected_artifact_id"]]
+                state = host.state_dir
+            print(json.dumps({"dataset": key, "served": parent_id, "prediction_check": serve_predictions(args.sdk, key, parent_root),
+                              "seconds": round(time.monotonic() - started, 1)}, ensure_ascii=False), flush=True)
+        finally:
+            if not args.keep:
+                shutil.rmtree(store, ignore_errors=True)
+
+    if args.parallel:
+        threads = [threading.Thread(target=run_dataset, args=(key,)) for key in args.datasets]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    else:
+        for key in args.datasets:
+            run_dataset(key)
     for number, call in enumerate(CALLS, 1):
         print(json.dumps({"live_call": number, **call}, ensure_ascii=False))
 

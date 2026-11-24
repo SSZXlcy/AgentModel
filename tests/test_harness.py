@@ -279,6 +279,18 @@ class StructureTests(unittest.TestCase):
         found = structure.detect(_synthetic_table(meta, np.asarray(y)), "regression")
         self.assertEqual((found["entity"], found["order"], found["countdown"]), (["machine_tag"], "tick", True))
 
+    def test_units_are_recovered_from_the_answer_order_without_meta(self):
+        """The platform rows carry only id, inputs and answer: units must come from the countdown chain."""
+        lives = (30, 120, 60, 45, 1, 80)
+        y = np.concatenate([np.arange(life - 1, -1, -1, dtype=float) for life in lives])
+        runs = structure.countdown_runs(y)
+        self.assertIsNotNone(runs)
+        self.assertEqual(runs["step"], 1.0)
+        self.assertEqual(np.bincount(runs["run"]).tolist(), list(lives))
+        independent = np.random.default_rng(0).integers(0, 300, 500).astype(float)
+        self.assertIsNone(structure.countdown_runs(independent))
+        self.assertIsNone(structure.countdown_runs(np.arange(100, dtype=float)))     # rising, not a countdown
+
     def test_composite_entity_key_is_found(self):
         meta, y = [], []
         for plant in ("P1", "P2"):
