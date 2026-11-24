@@ -1,0 +1,7 @@
+# Harness 与官方训练器（官方基线锁定 numpy 1.26.4，保持检查点可逐字节比较）
+numpy==1.26.4
+PyYAML==6.0.3
+# 平台协议 SDK（主办方提供，随源码放在 third_party/）
+./third_party/contest-harness-sdk-1.0.4
+# 可选：离线实验同步到 SwanLab
+# swanlab>=0.10

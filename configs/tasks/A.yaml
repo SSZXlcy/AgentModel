@@ -1,0 +1,9 @@
+# A: gas classification. Public-only simulation: the official validation split (batch2)
+# is cut into windows and plays the stream. The official checkpoint is the starting model.
+task: A
+package: cpu-a-guide-20261110-v1
+profile: A
+stream: validation
+window_size: 300
+anchor_fraction: 0.1
+leak_markers: ["data/raw", "batch3.dat", "batch10.dat"]

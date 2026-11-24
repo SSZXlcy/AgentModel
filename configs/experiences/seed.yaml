@@ -1,0 +1,130 @@
+# Seed experiences (经验库的初始经验): condition on the situation signature → one operator call.
+#
+# Conditions use only task-agnostic signature features (signature.py); parameters use placeholders
+# that are filled per task ($entity, $median_group_size, ...). No task or field name appears here.
+# `prior` is the starting credibility (high 0.8 / medium 0.6 / low 0.4); it moves with the probation
+# verdicts of the rounds that applied the experience. Rhythm experiences (mode.*) compete: the most
+# credible one whose condition holds is chosen; data and code experiences all apply (improvements are
+# still validated by the manual before they take effect, and only the most credible ones of each layer
+# are tried at the opening, because opening experiments are paid for).
+#
+# "Answers are timely" below means: the measured share of answers returned in their own window is at
+# least 0.5, or, before that share is measured, the structure says so — rows without a countdown carry
+# their answer at once, and a snapshot stream shows each unit once together with its answer.
+
+# ---------------------------------------------------------------- rhythm (the most credible one that fits)
+
+- id: E-covered
+  when: {inputs_covered: true}
+  action: {operator: mode.conserve}
+  why: >-
+    the latest inputs lie where the training data already is (input novelty at the level two training samples
+    show between themselves); retraining on more of the same has little to teach and every update risks a loss
+    on the next window, so watch with few answers and reopen when the inputs leave the known region
+  prior: high
+
+- id: E-event
+  when:
+    any:
+      - {label_timeliness: {"<": 0.5}}
+      - {label_timeliness: null, countdown: true, has_entity: true, stream_format: sequence}
+  action: {operator: mode.event}
+  why: >-
+    answers arrive only when an entity has finished (a countdown exists only after failure); between
+    completions there is nothing new to learn from, and a finished entity is the fairest judge
+  prior: medium
+
+- id: E-adaptive
+  when:
+    all:
+      - any:
+          - {label_timeliness: {">=": 0.5}}
+          - {label_timeliness: null, countdown: false}
+          - {label_timeliness: null, stream_format: snapshot}
+      - any:
+          # independent rows: follow the stream unless updates have been shown to earn nothing
+          # (undecided evidence does not reopen a rhythm that saving chose; a shift reopens it through T4)
+          - {has_entity: false, drift_exploitable: true}
+          - {has_entity: false, drift_exploitable: null, mode: {"!=": conserve}}
+          - {stream_format: snapshot, drift_exploitable: true}
+  action: {operator: mode.adaptive}
+  why: >-
+    answers arrive in the window and each fresh answer says something the model has not seen; training on
+    every fresh answer at once and letting the following windows confirm or roll back adapts fastest
+  prior: medium
+
+- id: E-standard
+  when:
+    all:
+      - any:
+          - {label_timeliness: {">=": 0.5}}
+          - {label_timeliness: null, stream_format: snapshot}
+      - {has_entity: true}
+      - any:
+          - {drift_exploitable: null, mode: {"!=": conserve}}
+          - {drift_exploitable: true, stream_format: {"!=": snapshot}}
+  action: {operator: mode.standard}
+  why: >-
+    answers arrive in time but rows of one entity are correlated: a candidate must first beat the serving
+    model on held-out entities of the window before it serves (the threshold "never below the static
+    model" comes first)
+  prior: medium
+
+- id: E-conserve
+  when:
+    all:
+      - any:
+          - {label_timeliness: {">=": 0.5}}
+          - {label_timeliness: null, countdown: false}
+          - {label_timeliness: null, stream_format: snapshot}
+      - {drift_exploitable: false}
+  action: {operator: mode.conserve}
+  why: updates have earned nothing on the next windows; stop paying for training and buy fewer answers
+  prior: medium
+
+# ---------------------------------------------------------------- tightening
+
+- id: E-split-entity
+  when: {has_entity: true}
+  action: {operator: split.by_group, params: {group_by: $entity}}
+  why: rows of one entity are correlated, so a candidate must be judged on entities it did not train on
+  prior: high
+
+# ---------------------------------------------------------------- data (validated at the opening)
+
+- id: E-cap
+  when: {has_entity: true, entity_imbalance: {">": 3}}
+  action: {operator: data.cap_per_group, params: {group_by: $entity, n: $median_group_size}}
+  why: a few long entities dominate the training rows; capping each at the median balances what the model learns
+  prior: medium
+
+- id: E-class-balance
+  when: {task_type: classification, class_imbalance: {">": 3}}
+  action: {operator: data.class_balance, params: {n: $median_class_size}}
+  why: rare classes weigh little in training; capping the large classes gives them more weight in macro-F1
+  prior: low
+
+# ---------------------------------------------------------------- training code (validated at the opening)
+
+- id: E-overestimate
+  when: {task_type: regression, countdown: true}
+  action: {operator: code.loss, params: {variant: asymmetric_overestimate_x4}}
+  why: >-
+    a single observation rarely tells how long a unit will last, and units that will fail soon are read as
+    average ones: remaining life is mostly over-estimated where the error is largest; penalising
+    over-estimates harder moves predictions toward the short lives without capping any target
+  prior: medium
+
+- id: E-relative-error
+  when: {task_type: regression, countdown: true}
+  action: {operator: code.sample_weight, params: {variant: relative_error}}
+  why: >-
+    rows far from failure dominate the squared error although they carry the least information; weighting
+    rows by 1 / (remaining life + its median) makes every part of a life count comparably
+  prior: medium
+
+- id: E-rare-class-weight
+  when: {task_type: classification, class_imbalance: {">": 3}}
+  action: {operator: code.sample_weight, params: {variant: sqrt_inverse_class_frequency}}
+  why: macro-F1 weighs every class equally while the loss weighs every row; 1/sqrt(class count) evens it out
+  prior: low

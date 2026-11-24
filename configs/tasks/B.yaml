@@ -1,0 +1,10 @@
+# B: bearing RUL in minutes. Only cpu-b-rul carries the current regression B profile;
+# configs/B.json in the A and C packages is the obsolete three-class version.
+# The entity key (bearing) is discovered from the training set; nothing about it is configured.
+task: B
+package: cpu-b-rul-20261110-v1
+profile: B
+stream: validation
+window_size: 200
+anchor_fraction: 0.1
+leak_markers: ["data/raw", "Bearing1_5", "Bearing2_5", "Bearing3_5"]

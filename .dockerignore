@@ -1,0 +1,9 @@
+*
+!docker/
+!src/
+!vendor/
+!submission/
+!third_party/
+!pyproject.toml
+**/__pycache__
+**/*.pyc

@@ -1,0 +1,4 @@
+Qwen/Qwen3.8-27B
+
+类型：平台白名单基础模型（PyTRiO 模型 ID，未微调，无持久 Sampler，因此没有 trio:// 路径）。
+调用方式：镜像内经宿主网关 rnd.model() 调用；PyTRiO API Key 只填在平台密钥栏，不在镜像、源码、文档和记录中。

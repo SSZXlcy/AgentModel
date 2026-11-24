@@ -1,0 +1,10 @@
+# C: turbofan RUL in cycles. Windows hold whole engines so no engine is split across windows; the engine key
+# (subset + unit) is discovered from the training set. The 113k-row official set is subsampled to the
+# generic base_rows_budget (training cost is scored).
+task: C
+package: cpu-c-guide-20261110-v1
+profile: C
+stream: validation
+window_groups: 10
+anchor_fraction: 0.05
+leak_markers: ["data/raw", "test_FD00", "RUL_FD00"]

@@ -1,0 +1,26 @@
+# π — inner-loop rule parameters. Calibrated on public data only.
+policy_id: default
+label_fraction: 0.5
+gate_fraction: 0.5
+max_candidates: 3
+max_epochs: 3
+min_samples: 300
+lr_scales_overfit: [0.5, 0.25]
+z: 2.0
+bootstrap_reps: 300
+min_gate_units: 8
+min_roi: 0.0
+anchor_veto: 0.25
+confirm_windows: 2
+static_floor_windows: 2
+cooldown_windows: 1
+drift_quantile: 0.95
+drift_reference_rows: 2000
+stall_windows: 2
+budget_train_seconds: 120.0
+budget_labels: null
+budget_llm_tokens: 200000
+cost_per_second: 1.0
+cost_per_label: 0.0
+cost_per_token: 0.0001
+replay_epochs: 2

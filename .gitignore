@@ -1,0 +1,10 @@
+.venv*/
+__pycache__/
+*.py[cod]
+/runs/
+/artifacts/
+/data/
+/cpu-*/
+*.zip
+*.tar
+*.tar.gz

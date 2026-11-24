@@ -1,0 +1,10 @@
+# C in the official test format, built from PUBLIC data only: every validation engine cut at a random cycle
+# and shown once (scripts/make_public_snapshot.py writes data/dev/C_validation_snapshot.jsonl).
+# Three passes over the 106 engines (a different random cut each pass), windows of 20 rows (about 16 windows).
+task: C
+package: cpu-c-guide-20261110-v1
+profile: C
+stream_file: data/dev/C_validation_snapshot.jsonl
+window_size: 20
+anchor_fraction: 0.05
+leak_markers: ["data/raw", "test_FD00", "RUL_FD00"]

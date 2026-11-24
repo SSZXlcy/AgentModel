@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-harness"
+version = "0.2.0"
+description = "Controlled self-evolving harness around the official CPU baselines"
+requires-python = ">=3.10"
+# The official baselines pin numpy==1.26.4; match it so checkpoints are byte-comparable.
+dependencies = ["numpy==1.26.4", "PyYAML>=6.0"]
+
+[project.optional-dependencies]
+tracking = ["swanlab>=0.10"]
+
+[project.scripts]
+agent-harness = "agent_harness.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
